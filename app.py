@@ -23,7 +23,7 @@ DATA_FILE = "nuril.csv"
 
 try:
     df_raw = pd.read_csv(DATA_FILE, header=None)
-except Exception as e:
+except Exception:
     st.error("❌ File 'nuril.csv' tidak ditemukan di folder yang sama dengan app.py.")
     st.stop()
 
@@ -57,7 +57,9 @@ label_map = {
     2: ("Stres Tinggi", "Risiko burnout; perlu perhatian.", "red")
 }
 
-# sidebar menu
+# ----------------------------
+# Sidebar menu
+# ----------------------------
 menu = st.sidebar.selectbox("Menu", [
     "Dataset",
     "Klasifikasi (Random Forest)",
@@ -67,7 +69,9 @@ menu = st.sidebar.selectbox("Menu", [
     "Perbandingan Metode"
 ])
 
-# common scaled matrix and model training helper
+# ----------------------------
+# Helpers: prepare scaler + X_scaled
+# ----------------------------
 @st.cache_data
 def prepare_scaled_data(df, features):
     scaler = StandardScaler()
@@ -75,7 +79,19 @@ def prepare_scaled_data(df, features):
     return scaler, X_scaled
 
 scaler, X_scaled = prepare_scaled_data(df, features)
-y = df["Label"]
+y = df["Label"].values
+
+# ----------------------------
+# GLOBAL RF MODEL (latih pada seluruh data untuk prediksi)
+# ----------------------------
+@st.cache_resource
+def train_global_rf(X, y, n_estimators=200):
+    rf = RandomForestClassifier(n_estimators=n_estimators, random_state=42)
+    rf.fit(X, y)
+    return rf
+
+# buat model global (dipakai di Prediksi Manual & CBR/KMeans mapping)
+rf_global = train_global_rf(X_scaled, y, n_estimators=200)
 
 # ----------------------------
 # MENU: DATASET
@@ -105,20 +121,20 @@ if menu == "Dataset":
 # MENU: Klasifikasi
 # ----------------------------
 elif menu == "Klasifikasi (Random Forest)":
-    st.header("🔎 Klasifikasi — Random Forest")
+    st.header("🔎 Klasifikasi — Random Forest (Evaluasi)")
 
-    st.info("Training RandomForest dengan split train/test (80/20). Tampilkan evaluasi: accuracy, confusion matrix, classification report, feature importance.")
+    st.info("Training RandomForest dengan split train/test. Evaluasi: accuracy, confusion matrix, classification report, feature importance.")
 
     # train-test split
     test_size = st.sidebar.slider("Test size (%)", 10, 40, 20)
     X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=test_size/100, random_state=42, stratify=y)
 
     n_estimators = st.sidebar.slider("n_estimators", 50, 500, 200, step=50)
-    model = RandomForestClassifier(n_estimators=n_estimators, random_state=42)
-    model.fit(X_train, y_train)
+    clf = RandomForestClassifier(n_estimators=n_estimators, random_state=42)
+    clf.fit(X_train, y_train)
 
     # predictions
-    y_pred = model.predict(X_test)
+    y_pred = clf.predict(X_test)
     acc = accuracy_score(y_test, y_pred)
     st.subheader(f"Akurasi (test set): {acc:.4f}")
 
@@ -136,7 +152,7 @@ elif menu == "Klasifikasi (Random Forest)":
     st.text(classification_report(y_test, y_pred, zero_division=0))
 
     st.subheader("Feature Importance")
-    imp = pd.DataFrame({"Fitur": features, "Importance": model.feature_importances_}).sort_values("Importance", ascending=False)
+    imp = pd.DataFrame({"Fitur": features, "Importance": clf.feature_importances_}).sort_values("Importance", ascending=False)
     st.dataframe(imp)
     fig2, ax2 = plt.subplots()
     ax2.barh(imp["Fitur"], imp["Importance"])
@@ -145,7 +161,7 @@ elif menu == "Klasifikasi (Random Forest)":
     st.subheader("Cross-validation (Stratified K-Fold)")
     cv_folds = st.slider("Jumlah fold CV", 3, 10, 5)
     skf = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=42)
-    scores = cross_val_score(model, X_scaled, y, cv=skf, scoring="accuracy")
+    scores = cross_val_score(clf, X_scaled, y, cv=skf, scoring="accuracy")
     st.write("Akurasi per fold:", np.round(scores,4))
     st.write("Rata-rata akurasi:", np.round(scores.mean(),4))
 
@@ -160,7 +176,7 @@ elif menu == "Klasterisasi (K-Means)":
     if clust_mode.startswith("Paksa"):
         k = 3
     else:
-        st.write("Elbow: hitung SSE untuk k dari 1 sampai 10, lalu pilih k")
+        st.write("Elbow: hitung SSE untuk k dari 1 sampai max_k, lalu pilih k")
         max_k = st.sidebar.slider("Max k untuk Elbow", 5, 15, 10)
         sse = []
         K_range = range(1, max_k+1)
@@ -226,25 +242,24 @@ elif menu == "CBR (Case-Based Reasoning)":
 
     if st.button("Cari Kasus Mirip (CBR)"):
         # prepare array
-        row = np.array([list(input_case.values())], dtype=float)
-        # use scaled space (important)
         row_scaled = scaler.transform(pd.DataFrame([input_case]))  # scaler from earlier
 
         if metric.startswith("euclidean"):
             dists = pairwise_distances(X_scaled, row_scaled, metric="euclidean").flatten()
-            similarity = None
-            # lower distance => more similar
             order = np.argsort(dists)
             st.write("Metric: Euclidean (jarak). Jarak lebih kecil = lebih mirip.")
+            top_idx = order[:k_sim]
+            dist_values = dists[top_idx]
         else:
             # cosine similarity (higher better)
             cos = cosine_similarity(X_scaled, row_scaled).flatten()
-            similarity = cos
             order = np.argsort(-cos)  # descending
+            st.write("Metric: Cosine (kesamaan). Nilai lebih tinggi = lebih mirip.")
+            top_idx = order[:k_sim]
+            dist_values = 1 - cos[top_idx]
 
-        top_idx = order[:k_sim]
         results = df.iloc[top_idx].copy()
-        results["Distance"] = dists[top_idx] if metric.startswith("euclidean") else (1 - similarity[top_idx])
+        results["Distance"] = np.round(dist_values, 4)
         results["Label"] = results["Label"].map(lambda r: label_map[r][0])
         st.subheader("Top-k kasus paling mirip")
         st.dataframe(results[features + ["Label", "Distance"]].reset_index(drop=True))
@@ -288,10 +303,10 @@ elif menu == "Prediksi Manual":
         row = pd.DataFrame([manual_input])
         row_scaled = scaler.transform(row)
 
-        # RF prediction
-        rf_pred = model.predict(row_scaled)[0]
-        rf_proba = model.predict_proba(row_scaled)[0]
-        st.subheader("Hasil Random Forest")
+        # RF prediction using global model (trained on full dataset)
+        rf_pred = rf_global.predict(row_scaled)[0]
+        rf_proba = rf_global.predict_proba(row_scaled)[0]
+        st.subheader("Hasil Random Forest (model global)")
         st.write(f"Label: **{label_map[rf_pred][0]}** — {label_map[rf_pred][1]}")
         prob_df = pd.DataFrame({"Label": [label_map[i][0] for i in range(3)], "Probabilitas": np.round(rf_proba,3)})
         st.table(prob_df)
@@ -303,19 +318,37 @@ elif menu == "Prediksi Manual":
         cbr_pred = cbr_votes.iloc[0] if len(cbr_votes)>0 else df.iloc[top_idx]["Label"].iloc[0]
         st.subheader("Hasil CBR (top-5, Euclidean)")
         st.write(f"Prediksi CBR (mayoritas): **{label_map[cbr_pred][0]}**")
-        st.dataframe(df.iloc[top_idx][features.tolist() + ["Label"]].reset_index(drop=True).assign(Distance=dists[top_idx]))
+        st.dataframe(df.iloc[top_idx][features + ["Label"]].reset_index(drop=True).assign(Distance=np.round(dists[top_idx],4)))
 
+        # KMeans nearest centroid (k=3)
         # KMeans nearest centroid
         kmeans_for_pred = KMeans(n_clusters=3, random_state=42, n_init=10).fit(X_scaled)
         centroid_dists = pairwise_distances(kmeans_for_pred.cluster_centers_, row_scaled, metric="euclidean").flatten()
         nearest_cluster = np.argmin(centroid_dists)
+
         st.subheader("Hasil K-Means (cluster terdekat centroid)")
         st.write(f"Cluster terdekat: {nearest_cluster}")
+
         # map cluster -> majority label in that cluster
         cluster_assign = kmeans_for_pred.predict(X_scaled)
-        df_tmp = df.copy(); df_tmp["Cluster"] = cluster_assign
+        df_tmp = df.copy()
+        df_tmp["Cluster"] = cluster_assign
+
         maj_label = df_tmp[df_tmp["Cluster"]==nearest_cluster]["Label"].mode().iloc[0]
         st.write(f"Label mayoritas pada cluster ini: **{label_map[maj_label][0]}**")
+
+        # ======= Tambahkan Tabel Anggota Cluster =======
+        st.write("### 🔍 Contoh Data Dalam Cluster Ini")
+        cluster_members = df_tmp[df_tmp["Cluster"] == nearest_cluster]
+        st.dataframe(cluster_members.head(10))  # tampilkan 10 baris awal
+
+        # ======= Tambahkan Tabel Nilai Centroid =======
+        st.write("### 📌 Nilai Centroid Cluster")
+        centroid_values = pd.DataFrame(
+            [kmeans_for_pred.cluster_centers_[nearest_cluster]],
+            columns=features
+        )
+        st.dataframe(centroid_values)
 
 # ----------------------------
 # MENU: Perbandingan Metode
@@ -343,15 +376,13 @@ elif menu == "Perbandingan Metode":
     purity = purity / len(df_tmp)
 
     # quick CBR estimate: using leave-one-out accuracy by top-5 majority
-    # For speed, sample or do for entire dataset
     preds_cbr = []
     for i in range(len(X_scaled)):
-        row = X_scaled[i].reshape(1,-1)
-        dists = pairwise_distances(np.delete(X_scaled, i, axis=0), row, metric="euclidean").flatten()
+        row_i = X_scaled[i].reshape(1,-1)
+        dists = pairwise_distances(np.delete(X_scaled, i, axis=0), row_i, metric="euclidean").flatten()
         idxs = np.argsort(dists)[:5]
         labels_pool = np.delete(df["Label"].values, i)[idxs]
-        # mode
-        if len(labels_pool)>0:
+        if len(labels_pool) > 0:
             preds_cbr.append(pd.Series(labels_pool).mode().iloc[0])
         else:
             preds_cbr.append(df["Label"].iloc[i])
